@@ -1,7 +1,6 @@
 name: Software Defect Prediction
 
 on:
-  # Schedule intentionally omitted for initial testing — enable it in Step 8.
   workflow_dispatch:
     inputs:
       start_date:
@@ -10,10 +9,26 @@ on:
       end_date:
         description: 'End (ISO-8601 UTC)'
         required: false
+      channel:
+        description: 'Delivery channel: auto (probe) | ghas | native'
+        required: false
+        default: 'auto'
+      gate_mode:
+        description: 'Gate: off | absolute | delta'
+        required: false
+        default: 'off'
+      gate_threshold:
+        description: 'Absolute-gate max defects allowed (integer)'
+        required: false
+        default: '0'
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
-  security-events: write   # Required for SARIF upload
+  security-events: write   # SARIF upload (Group A)
+  checks: write            # check runs + annotations (Group B)
+  pull-requests: write     # sticky PR comment (Group B)
 
 concurrency:
   group: sdp-${{ github.ref }}
@@ -24,6 +39,10 @@ env:
   SDP_VERSION: v0.1.1
   CSV_PATH: ${{ github.workspace }}/sdp-report.csv
   SARIF_PATH: ${{ github.workspace }}/sdp.sarif
+  FINDINGS_PATH: ${{ github.workspace }}/sdp-findings.json
+  # Consumed by the production thin-client binary (mock ignores both).
+  MAGIA_API_KEY: ${{ secrets.MAGIA_API_KEY }}
+  MAGIA_API_URL: ${{ vars.MAGIA_API_URL }}
 
 jobs:
   predict:
@@ -32,10 +51,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout main (full history)
+      - name: Checkout (full history)
         uses: actions/checkout@v5
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.head.sha || 'main' }}
           # Required: the tool walks commit history between the two dates.
           fetch-depth: 0
 
@@ -47,7 +66,17 @@ jobs:
           END_DATE="${{ inputs.end_date }}"
           START_DATE="${{ inputs.start_date }}"
           [[ -n "$END_DATE"   ]] || END_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          [[ -n "$START_DATE" ]] || START_DATE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [[ -z "$START_DATE" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+              # Window anchoring: this PR's development period (merge-base commit date -> now),
+              # so the forecast covers exactly the branch's commits.
+              MB_SHA="$(git merge-base origin/main HEAD)"
+              START_DATE="$(git show -s --format=%cI "$MB_SHA")"
+            else
+              START_DATE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+            fi
+          fi
 
           echo "start_date=$START_DATE" >> "$GITHUB_OUTPUT"
           echo "end_date=$END_DATE"     >> "$GITHUB_OUTPUT"
@@ -101,7 +130,10 @@ jobs:
 
           echo "has_data=true" >> "$GITHUB_OUTPUT"
 
-          DEFECTS=$(awk -F',' 'NR>1 && $3 ~ /1/ {c++} END {print c+0}' "$CSV_PATH")
+          # fixes = column 6 (v1 matched the placeholder column and undercounted).
+          DEFECTS=$(awk -F',' 'NR>1 && $6=="1"' "$CSV_PATH" | wc -l)
+          echo "defects=$DEFECTS" >> "$GITHUB_OUTPUT"
+
           {
             echo "### Defect Prediction Summary"
             echo "| Metric | Value |"
@@ -117,8 +149,20 @@ jobs:
         env:
           SDP_API_URL: ${{ secrets.SDP_API_URL }}
           SDP_API_TOKEN: ${{ secrets.SDP_API_TOKEN }}
+          SDP_REPO_ID: ${{ secrets.SDP_REPO_ID }}
         run: |
           set -euo pipefail
+
+          FORMS=(--form "report=@${CSV_PATH};type=text/csv"
+                 --form "repository=${{ github.repository }}"
+                 --form "commit_sha=${{ github.sha }}"
+                 --form "start_date=${{ steps.window.outputs.start_date }}"
+                 --form "end_date=${{ steps.window.outputs.end_date }}")
+          # cyberfactors customers set SDP_REPO_ID so the backend maps the report
+          # to a known repository row (PoC mode omits it).
+          if [[ -n "$SDP_REPO_ID" ]]; then
+            FORMS+=(--form "repo_id=$SDP_REPO_ID")
+          fi
 
           HTTP_CODE=$(curl --silent --show-error \
             --retry 3 --retry-delay 5 --retry-all-errors \
@@ -126,11 +170,7 @@ jobs:
             --write-out '%{http_code}' --output /tmp/api-response.txt \
             --request POST "$SDP_API_URL" \
             --header "Authorization: Bearer $SDP_API_TOKEN" \
-            --form "report=@${CSV_PATH};type=text/csv" \
-            --form "repository=${{ github.repository }}" \
-            --form "commit_sha=${{ github.sha }}" \
-            --form "start_date=${{ steps.window.outputs.start_date }}" \
-            --form "end_date=${{ steps.window.outputs.end_date }}")
+            "${FORMS[@]}")
 
           echo "Backend responded HTTP $HTTP_CODE"
           if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
@@ -139,18 +179,43 @@ jobs:
             exit 1
           fi
 
-      - name: Convert CSV to SARIF
+      - name: Convert CSV (SARIF + neutral findings)
         if: steps.validate.outputs.has_data == 'true'
         run: |
           set -euo pipefail
           python3 .github/scripts/csv_to_sarif.py "$CSV_PATH" "$SARIF_PATH"
+          python3 .github/scripts/csv_to_findings.py "$CSV_PATH" "$FINDINGS_PATH" \
+            --repository "${{ github.repository }}" \
+            --commit-sha "${{ github.sha }}" \
+            --start-date "${{ steps.window.outputs.start_date }}" \
+            --end-date "${{ steps.window.outputs.end_date }}" \
+            --tool-version "$SDP_VERSION"
 
-          echo "--- SARIF result count ---"
-          python3 -c "import json,sys; \
-            print(len(json.load(open('$SARIF_PATH'))['runs'][0]['results']))"
+          echo "--- result counts ---"
+          python3 -c "import json;print('sarif results:', len(json.load(open('$SARIF_PATH'))['runs'][0]['results']))"
+          python3 -c "import json;print('findings:', len(json.load(open('$FINDINGS_PATH'))['findings']))"
+
+      - name: Detect delivery channel
+        id: channel
+        if: steps.validate.outputs.has_data == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHANNEL="${{ inputs.channel || vars.SDP_CHANNEL || 'auto' }}"
+          if [[ "$CHANNEL" == "auto" ]]; then
+            # GITHUB_TOKEN is an installation token: the probe needs no extra rights.
+            if gh api "repos/${{ github.repository }}/code-scanning/alerts" >/dev/null 2>&1; then
+              CHANNEL="ghas"
+            else
+              CHANNEL="native"
+            fi
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Delivery channel::$CHANNEL"
 
       - name: Upload SARIF to Code Scanning
-        if: steps.validate.outputs.has_data == 'true'
+        if: steps.channel.outputs.channel == 'ghas'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ env.SARIF_PATH }}
@@ -159,7 +224,162 @@ jobs:
           # Fail loudly if GitHub rejects the SARIF, rather than failing silently.
           wait-for-processing: true
 
-      - name: Archive report and SARIF
+      - name: Evaluate gate
+        id: gate
+        if: steps.validate.outputs.has_data == 'true'
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.gate_mode || vars.SDP_GATE_MODE || 'off' }}"
+          THRESHOLD="${{ inputs.gate_threshold || vars.SDP_GATE_THRESHOLD || '0' }}"
+          [[ "$THRESHOLD" =~ ^[0-9]+$ ]] || THRESHOLD=0
+          DEFECTS="${{ steps.validate.outputs.defects }}"
+
+          VERDICT="pass"
+          REASON="gate off"
+
+          if [[ "$MODE" == "absolute" ]]; then
+            REASON="absolute: $DEFECTS defects, threshold $THRESHOLD"
+            if (( DEFECTS > THRESHOLD )); then VERDICT="fail"; fi
+          elif [[ "$MODE" == "delta" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+              echo "::notice title=Gate skipped::delta mode applies to pull_request events only"
+              REASON="delta skipped (non-PR event)"
+            else
+              BASE_DIR="$RUNNER_TEMP/base"
+              BASE_CSV="$RUNNER_TEMP/base.csv"
+              git worktree add "$BASE_DIR" "${{ github.event.pull_request.base.sha }}"
+              "$RUNNER_TEMP/sdp" \
+                --repo "$BASE_DIR" \
+                --start-date "${{ steps.window.outputs.start_date }}" \
+                --end-date   "${{ steps.window.outputs.end_date }}" \
+                --output     "$BASE_CSV"
+              BASE=$(awk -F',' 'NR>1 && $6=="1"' "$BASE_CSV" | wc -l)
+              git worktree remove --force "$BASE_DIR" || true
+              NEW=$(( DEFECTS - BASE ))
+              REASON="delta: $DEFECTS head vs $BASE base ($NEW new)"
+              if (( NEW > 0 )); then VERDICT="fail"; fi
+            fi
+          fi
+
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON"   >> "$GITHUB_OUTPUT"
+          echo "::notice title=Gate::$VERDICT ($REASON)"
+
+      - name: Native deliver (check run + PR comment)
+        if: steps.channel.outputs.channel == 'native' && steps.validate.outputs.has_data == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          MARKER='<!-- sdp-defect-prediction -->'
+
+          TOTAL=$(jq '[.findings[] | select(.defect)] | length' "$FINDINGS_PATH")
+
+          # --- PR diff intersection -------------------------------------------------
+          FILTERED="$RUNNER_TEMP/findings-filtered.json"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]] \
+             && gh api --paginate "repos/$REPO/pulls/${{ github.event.number }}/files" \
+                  --jq '.[].filename' > "$RUNNER_TEMP/pr-files.txt"; then
+            jq --rawfile changed "$RUNNER_TEMP/pr-files.txt" \
+              '[.findings[] | select(.defect)
+                | select(.file_path as $fp | ($changed | split("\n") | index($fp)))]' \
+              "$FINDINGS_PATH" > "$FILTERED"
+          else
+            if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+              echo "::warning title=Diff intersection::files API failed; annotating all findings"
+            fi
+            jq '[.findings[] | select(.defect)]' "$FINDINGS_PATH" > "$FILTERED"
+          fi
+          INTERSECT=$(jq 'length' "$FILTERED")
+
+          # --- annotations ------------------------------------------------------------
+          jq -c '[.[] | {path: .file_path, start_line: .start_line, end_line: .start_line,
+                         annotation_level: "warning",
+                         message: "Function \u0027\(.function_name)\u0027 is predicted to be defect-prone. Review logic and test coverage.",
+                         title: "Predicted defect: \(.function_name)"}]' \
+            "$FILTERED" > "$RUNNER_TEMP/annotations.json"
+          ANNOT_COUNT=$(jq 'length' "$RUNNER_TEMP/annotations.json")
+
+          # --- check run ---------------------------------------------------------------
+          CONCLUSION="success"
+          if [[ "${{ steps.gate.outputs.verdict }}" == "fail" ]]; then CONCLUSION="failure"; fi
+          TITLE="SDP: ${INTERSECT} predicted-defect function(s) intersecting this PR (of ${TOTAL} forecasted)"
+          SUMMARY=$(cat <<MD
+          | Metric | Value |
+          |---|---|
+          | Window | ${{ steps.window.outputs.start_date }} → ${{ steps.window.outputs.end_date }} |
+          | Forecasted (window) | $TOTAL |
+          | Intersecting this PR | $INTERSECT |
+          | Gate | ${{ steps.gate.outputs.verdict }} (${{ steps.gate.outputs.reason }}) |
+          MD
+          )
+          jq -n --arg name "SDP defect prediction" --arg sha "$SHA" \
+                --arg conclusion "$CONCLUSION" --arg title "$TITLE" \
+                --arg summary "$SUMMARY" \
+                --slurpfile annos <(jq 'if length > 50 then .[0:50] else . end' "$RUNNER_TEMP/annotations.json"; true) \
+            '{name: $name, head_sha: $sha, status: "completed", conclusion: $conclusion,
+              output: {title: $title, summary: $summary, annotations: ($annos[0] // [])}}' \
+            > "$RUNNER_TEMP/checkrun.json"
+          CHECK_ID=$(gh api --method POST "repos/$REPO/check-runs" \
+                     --input "$RUNNER_TEMP/checkrun.json" --jq '.id')
+          echo "Check run $CHECK_ID created ($CONCLUSION) with $ANNOT_COUNT annotation(s)"
+
+          # additional annotation batches of <=50 via PATCH
+          REMAINING=$(( ANNOT_COUNT - 50 ))
+          OFFSET=50
+          while (( REMAINING > 0 )); do
+            jq --slurpfile annos <(jq ".[${OFFSET}:$((OFFSET+50))]" "$RUNNER_TEMP/annotations.json") \
+              -n '{output: {annotations: ($annos[0] // [])}}' > "$RUNNER_TEMP/patch.json"
+            gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" --input "$RUNNER_TEMP/patch.json" >/dev/null
+            OFFSET=$((OFFSET+50)); REMAINING=$((REMAINING-50))
+          done
+
+          # --- sticky PR comment --------------------------------------------------------
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            {
+              echo "$MARKER"
+              echo "## Defect Prediction Summary"
+              echo "| Metric | Value |"
+              echo "|---|---|"
+              echo "| Window | ${{ steps.window.outputs.start_date }} → ${{ steps.window.outputs.end_date }} |"
+              echo "| Forecasted (window) | $TOTAL |"
+              echo "| Intersecting this PR | $INTERSECT |"
+              echo "| Gate | ${{ steps.gate.outputs.verdict }} — ${{ steps.gate.outputs.reason }} |"
+              echo
+              if (( INTERSECT > 0 )); then
+                echo "**Findings intersecting this PR**"
+                jq -r '.[] | "- `\(.file_path):\(.start_line)` — `\(.function_name)`"' "$FILTERED"
+              else
+                echo "No forecasted risk intersects this PR ✅"
+              fi
+              echo
+              echo "[View run](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})"
+            } > "$RUNNER_TEMP/comment.md"
+
+            jq -n --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' > "$RUNNER_TEMP/comment.json"
+            EXISTING_ID=$(gh api "repos/$REPO/issues/${{ github.event.number }}/comments?per_page=100" \
+                           --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
+            if [[ -n "$EXISTING_ID" ]]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$EXISTING_ID" \
+                --input "$RUNNER_TEMP/comment.json" >/dev/null
+              echo "Updated sticky comment $EXISTING_ID"
+            else
+              gh api --method POST "repos/$REPO/issues/${{ github.event.number }}/comments" \
+                --input "$RUNNER_TEMP/comment.json" >/dev/null
+              echo "Created sticky comment"
+            fi
+          fi
+
+      - name: Enforce gate
+        if: steps.gate.outputs.verdict == 'fail'
+        run: |
+          set -euo pipefail
+          echo "::error title=SDP gate failed::${{ steps.gate.outputs.reason }}"
+          exit 1
+
+      - name: Archive report, SARIF and findings
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -167,5 +387,6 @@ jobs:
           path: |
             ${{ env.CSV_PATH }}
             ${{ env.SARIF_PATH }}
+            ${{ env.FINDINGS_PATH }}
           retention-days: 14
           if-no-files-found: warn
